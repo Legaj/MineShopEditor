@@ -126,6 +126,13 @@
   .file-row .count { font-size: 11px; color: var(--text-dim); }
   .file-row .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--gold); display: none; flex-shrink: 0; }
   .file-row.dirty .dot { display: block; }
+  .folder-label {
+    font-size: 10.5px; color: var(--text-dim);
+    padding: 8px 8px 3px; margin-top: 4px;
+    border-top: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .folder-label:first-child { border-top: none; }
   .file-row .dl { opacity: 0; font-size: 11px; padding: 2px 6px; }
   .file-row:hover .dl { opacity: 1; }
 
@@ -175,6 +182,15 @@
   .toolbar .spacer { flex: 1; }
   .pill { font-size: 11px; color: var(--text-dim); background: var(--panel-alt); padding: 3px 8px; border-radius: 20px; }
 
+  #schema-banner {
+    margin: 12px 18px 0;
+    padding: 10px 14px;
+    background: #2a2510;
+    border: 1px solid var(--gold);
+    border-radius: var(--radius);
+    color: var(--gold);
+    font-size: 12.5px;
+  }
   #grid-wrap { flex: 1; overflow-y: auto; padding: 16px 18px 60px; }
   #grid {
     display: grid;
@@ -316,7 +332,8 @@
     </div>
     <button id="btn-add-files">+ Add YAML files</button>
     <button id="btn-add-folder">+ Add shops folder</button>
-    <button id="btn-export-zip" class="primary" disabled>Export all as .zip</button>
+    <button id="btn-export-folder" class="primary" disabled>Export to folder</button>
+    <button id="btn-export-zip" disabled>Export as .zip instead</button>
     <input type="file" id="file-input" accept=".yml,.yaml" multiple>
     <input type="file" id="folder-input" webkitdirectory multiple>
   </header>
@@ -355,6 +372,7 @@
           <span class="pill" style="align-self:center;">Re-parses this file from the text above — item cards below will refresh</span>
         </div>
       </div>
+      <div id="schema-banner" style="display:none;"></div>
       <div id="grid-wrap">
         <div id="grid"></div>
       </div>
@@ -414,8 +432,9 @@
       try{
         const text = await readFileAsText(f);
         const data = jsyaml.load(text) || {};
-        const name = f.name;
-        state.files[name] = { data, dirty: false };
+        const relPath = (f.webkitRelativePath && f.webkitRelativePath.length) ? f.webkitRelativePath
+                        : (f.relPath || f.name);
+        state.files[relPath] = { data, dirty: false };
         loaded++;
       }catch(e){
         console.error("Failed to parse", f.name, e);
@@ -428,6 +447,7 @@
       sidebarEl.style.display = 'block';
       mainEl.style.display = 'flex';
       el('btn-export-zip').disabled = false;
+      el('btn-export-folder').disabled = false;
       if (!state.activeFile){
         state.activeFile = Object.keys(state.files)[0];
       }
@@ -436,8 +456,68 @@
     }
   }
 
+  function readAllEntries(reader){
+    return new Promise((resolve) => {
+      let all = [];
+      function readBatch(){
+        reader.readEntries(entries => {
+          if (!entries.length) resolve(all);
+          else { all = all.concat(entries); readBatch(); }
+        });
+      }
+      readBatch();
+    });
+  }
+
+  function traverseFileTree(entry, path, out){
+    return new Promise((resolve) => {
+      if (entry.isFile){
+        entry.file(file => {
+          file.relPath = path + file.name;
+          out.push(file);
+          resolve();
+        });
+      } else if (entry.isDirectory){
+        const reader = entry.createReader();
+        readAllEntries(reader).then(entries => {
+          Promise.all(entries.map(e => traverseFileTree(e, path + entry.name + '/', out))).then(resolve);
+        });
+      } else {
+        resolve();
+      }
+    });
+  }
+
+  async function ingestDataTransfer(dataTransfer){
+    const items = dataTransfer.items;
+    if (items && items.length && items[0].webkitGetAsEntry){
+      const out = [];
+      const promises = [];
+      for (const item of items){
+        const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+        if (entry) promises.push(traverseFileTree(entry, '', out));
+      }
+      await Promise.all(promises);
+      if (out.length) { ingestFiles(out); return; }
+    }
+    if (dataTransfer.files && dataTransfer.files.length) ingestFiles(dataTransfer.files);
+  }
+
   /* ---------------- Item detection ---------------- */
-  function isPriceKey(k){ return /price/i.test(k); }
+  function isPriceKey(k, val){
+    if (/price/i.test(k)) return true;
+    if (/^(buy|sell)$/i.test(k) && typeof val === 'number') return true;
+    return false;
+  }
+
+  function hasMaterialKey(obj){
+    return Object.keys(obj).some(k => /^(material|item)$/i.test(k) && typeof obj[k] === 'string');
+  }
+
+  function stripColorCodes(s){
+    if (typeof s !== 'string') return s;
+    return s.replace(/<[^>]+>/g, '').replace(/&[0-9a-fk-or]/gi, '').replace(/^['"]|['"]$/g, '').trim();
+  }
 
   function findItemNodes(obj, path){
     path = path || [];
@@ -446,8 +526,9 @@
       obj.forEach((v, i) => { out = out.concat(findItemNodes(v, path.concat(i))); });
     } else if (obj && typeof obj === 'object'){
       const keys = Object.keys(obj);
-      const hasPrice = keys.some(isPriceKey);
-      if (hasPrice){
+      const hasPrice = keys.some(k => isPriceKey(k, obj[k]));
+      const hasMaterial = hasMaterialKey(obj);
+      if (hasPrice || hasMaterial){
         out.push({ path: path.slice(), node: obj });
       } else {
         for (const k of keys){
@@ -470,6 +551,18 @@
     const last = path[path.length - 1];
     if (Array.isArray(parent)) parent.splice(last, 1);
     else delete parent[last];
+  }
+
+  function deriveDisplayName(node, path){
+    const rawDisplay = node.displayname || node.DisplayName || node.DISPLAYNAME || node.name || node.Name;
+    if (rawDisplay) return stripColorCodes(rawDisplay);
+    // prefer the map key (e.g. "water_worker") since material is often shared
+    // across many entries (every enchanted book is material: ENCHANTED_BOOK)
+    for (let i = path.length - 1; i >= 0; i--){
+      if (typeof path[i] === 'string') return prettyLabel(path[i]);
+    }
+    const mat = node.material || node.MATERIAL || node.Material;
+    return mat ? prettyLabel(String(mat).replace(/^minecraft:/,'')) : 'Unknown Item';
   }
 
   function guessItemId(node, path){
@@ -514,28 +607,45 @@
   /* ---------------- Rendering: sidebar ---------------- */
   function renderSidebar(){
     fileListEl.innerHTML = '';
-    Object.keys(state.files).sort().forEach(name => {
-      const f = state.files[name];
-      const items = findItemNodes(f.data, []);
-      const row = document.createElement('div');
-      row.className = 'file-row' + (name === state.activeFile ? ' active' : '') + (f.dirty ? ' dirty' : '');
-      row.innerHTML = `
-        <span class="dot" title="Unsaved changes"></span>
-        <span class="name" title="${name}">${name.replace(/\.ya?ml$/i,'')}</span>
-        <span class="count">${items.length}</span>
-        <button class="dl" title="Download this file">⤓</button>
-      `;
-      row.addEventListener('click', (e) => {
-        if (e.target.closest('.dl')) return;
-        state.activeFile = name;
-        renderSidebar();
-        renderShop();
+    const names = Object.keys(state.files).sort();
+    const groups = {};
+    names.forEach(n => {
+      const parts = n.split('/');
+      const folder = parts.length > 1 ? parts.slice(0, -1).join('/') : '';
+      groups[folder] = groups[folder] || [];
+      groups[folder].push(n);
+    });
+    Object.keys(groups).sort().forEach(folder => {
+      if (folder){
+        const label = document.createElement('div');
+        label.className = 'folder-label';
+        label.textContent = folder;
+        fileListEl.appendChild(label);
+      }
+      groups[folder].forEach(name => {
+        const f = state.files[name];
+        const items = findItemNodes(f.data, []);
+        const displayName = name.split('/').pop();
+        const row = document.createElement('div');
+        row.className = 'file-row' + (name === state.activeFile ? ' active' : '') + (f.dirty ? ' dirty' : '');
+        row.innerHTML = `
+          <span class="dot" title="Unsaved changes"></span>
+          <span class="name" title="${name}">${displayName.replace(/\.ya?ml$/i,'')}</span>
+          <span class="count">${items.length}</span>
+          <button class="dl" title="Download this file">⤓</button>
+        `;
+        row.addEventListener('click', (e) => {
+          if (e.target.closest('.dl')) return;
+          state.activeFile = name;
+          renderSidebar();
+          renderShop();
+        });
+        row.querySelector('.dl').addEventListener('click', (e) => {
+          e.stopPropagation();
+          exportFile(name);
+        });
+        fileListEl.appendChild(row);
       });
-      row.querySelector('.dl').addEventListener('click', (e) => {
-        e.stopPropagation();
-        exportFile(name);
-      });
-      fileListEl.appendChild(row);
     });
   }
 
@@ -544,12 +654,13 @@
     const name = state.activeFile;
     if (!name) return;
     const f = state.files[name];
-    el('shop-title').textContent = name.replace(/\.ya?ml$/i, '');
+    el('shop-title').textContent = name;
     const items = findItemNodes(f.data, []);
     el('shop-count').textContent = `${items.length} item${items.length===1?'':'s'}`;
 
     const q = state.search.trim().toLowerCase();
     gridEl.innerHTML = '';
+    let anyPriced = false;
 
     items.forEach(({node, path}) => {
       const itemId = guessItemId(node, path);
@@ -559,7 +670,7 @@
       const card = document.createElement('div');
       card.className = 'card';
 
-      const priceKeys = Object.keys(node).filter(isPriceKey);
+      const priceKeys = Object.keys(node).filter(k => isPriceKey(k, node[k]));
       const buyKey = priceKeys.find(k => /buy/i.test(k)) || (priceKeys.length ? priceKeys[0] : null);
       const sellKey = priceKeys.find(k => /sell/i.test(k));
       const otherKeys = Object.keys(node).filter(k => !priceKeys.includes(k));
@@ -595,8 +706,13 @@
 
       const meta = document.createElement('div');
       meta.className = 'item-meta';
+      const shownName = deriveDisplayName(node, path);
+      const tagBits = [];
+      if (node.section) tagBits.push(String(node.section));
+      if (Array.isArray(node.enchantments) && node.enchantments.length) tagBits.push(String(node.enchantments[0]));
+      const tagStr = tagBits.length ? ` <span style="color:var(--text-dim);">· ${tagBits.join(' · ')}</span>` : '';
       meta.innerHTML = `
-        <div class="item-name">${prettyLabel(String(itemId).replace(/^minecraft:/,''))}</div>
+        <div class="item-name">${shownName}${tagStr}</div>
         <div class="item-id">${itemId}</div>
       `;
 
@@ -629,13 +745,7 @@
 
       if (buyKey) priceRow.appendChild(makePriceField(buyKey, 'buy', 'Buy'));
       if (sellKey) priceRow.appendChild(makePriceField(sellKey, 'sell', 'Sell'));
-      if (!buyKey && !sellKey && priceKeys.length === 0){
-        const wrap = document.createElement('div');
-        wrap.className = 'price-field';
-        wrap.innerHTML = `<label>No price fields found</label>`;
-        priceRow.appendChild(wrap);
-      }
-      card.appendChild(priceRow);
+      if (buyKey || sellKey) { card.appendChild(priceRow); anyPriced = true; }
 
       // extra price keys beyond buy/sell (e.g. a plain "price" plus something else)
       const leftoverPriceKeys = priceKeys.filter(k => k !== buyKey && k !== sellKey);
@@ -701,7 +811,7 @@
     });
 
     if (gridEl.children.length === 0){
-      gridEl.innerHTML = `<div class="pill" style="padding:10px 14px;">No items match${q? ' your filter' : ' — this file may use a schema this tool doesn\\'t recognize; try "View raw YAML" below.'}</div>`;
+      gridEl.innerHTML = `<div class="pill" style="padding:10px 14px;">No items match${q ? ' your filter' : ' — this file may use a schema this tool does not recognize; try "View raw YAML" below.'}</div>`;
     }
 
     // sync raw textarea if open
@@ -733,6 +843,43 @@
     f.dirty = false;
     renderSidebar();
     toast(`Exported ${name}`);
+  }
+
+  async function getNestedFileHandle(rootHandle, relPath){
+    const parts = relPath.split('/');
+    const fileName = parts.pop();
+    let dir = rootHandle;
+    for (const part of parts){
+      dir = await dir.getDirectoryHandle(part, { create: true });
+    }
+    return dir.getFileHandle(fileName, { create: true });
+  }
+
+  async function exportToFolder(){
+    const names = Object.keys(state.files);
+    if (names.length === 0) return;
+    if (!('showDirectoryPicker' in window)){
+      toast("This browser can't write folders directly (try Chrome or Edge) — use \"Export as .zip instead\".");
+      return;
+    }
+    try{
+      const dirHandle = await window.showDirectoryPicker();
+      for (const name of names){
+        const yamlStr = jsyaml.dump(state.files[name].data, { lineWidth: -1, noRefs: true });
+        const fileHandle = await getNestedFileHandle(dirHandle, name);
+        const writable = await fileHandle.createWritable();
+        await writable.write(yamlStr);
+        await writable.close();
+        state.files[name].dirty = false;
+      }
+      renderSidebar();
+      toast(`Wrote ${names.length} file${names.length===1?'':'s'} to the selected folder, subfolders included.`);
+    }catch(e){
+      if (e.name !== 'AbortError'){
+        console.error(e);
+        toast('Folder export failed — see browser console for details.');
+      }
+    }
   }
 
   async function exportAllZip(){
@@ -780,6 +927,7 @@
   el('btn-add-folder-2').addEventListener('click', () => el('folder-input').click());
   el('file-input').addEventListener('change', (e) => ingestFiles(e.target.files));
   el('folder-input').addEventListener('change', (e) => ingestFiles(e.target.files));
+  el('btn-export-folder').addEventListener('click', exportToFolder);
   el('btn-export-zip').addEventListener('click', exportAllZip);
   el('btn-export-current').addEventListener('click', () => state.activeFile && exportFile(state.activeFile));
   el('btn-toggle-raw').addEventListener('click', toggleRaw);
@@ -789,16 +937,13 @@
   const dz = el('dropzone');
   ['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('hover'); }));
   ['dragleave','drop'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('hover'); }));
-  dz.addEventListener('drop', (e) => {
-    const items = e.dataTransfer.files;
-    if (items && items.length) ingestFiles(items);
-  });
+  dz.addEventListener('drop', (e) => { ingestDataTransfer(e.dataTransfer); });
   // also allow dropping anywhere on the page once loaded
   document.body.addEventListener('dragover', (e) => e.preventDefault());
   document.body.addEventListener('drop', (e) => {
     if (e.target.closest('#dropzone')) return;
     e.preventDefault();
-    if (e.dataTransfer.files && e.dataTransfer.files.length) ingestFiles(e.dataTransfer.files);
+    ingestDataTransfer(e.dataTransfer);
   });
 
 })();
